@@ -3,7 +3,6 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 import pkg from "pg";
 import cron from "node-cron";
 import * as cheerio from "cheerio";
-import { schedule } from "node-cron-timezone";
 
 const { Pool } = pkg;
 
@@ -679,12 +678,12 @@ async function start() {
     // await main().catch(err => console.error(`[${getVietnamLogTime()}] Startup run failed:`, err));
     
     // Schedule job to run at specific Vietnam times: 0h, 3h, 6h, 9h, 12h, 15h, 18h, 21h (every 3 hours)
-    // Using timezone-aware cron scheduling
+    // Using node-cron's built-in timezone support
     console.log(`[${getVietnamLogTime()}] Scheduling job with cron: ${CRON_SCHEDULE} (Vietnam timezone)`);
     console.log(`[${getVietnamLogTime()}] Will run at: 00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00, 21:00 (Vietnam time)`);
     console.log(`[${getVietnamLogTime()}] Current Vietnam time: ${getVietnamLogTime()}`);
     
-    schedule(CRON_SCHEDULE, VIETNAM_TIMEZONE, async () => {
+    cron.schedule(CRON_SCHEDULE, async () => {
       console.log(`[${getVietnamLogTime()}] Scheduled job triggered`);
       try {
         await main();
@@ -692,6 +691,8 @@ async function start() {
         console.error(`[${getVietnamLogTime()}] Scheduled job error:`, error);
         // Don't exit - let it retry on next schedule
       }
+    }, {
+      timezone: VIETNAM_TIMEZONE
     });
     
     console.log(`[${getVietnamLogTime()}] Scheduler started. Waiting for next scheduled run...`);
