@@ -675,7 +675,7 @@ async function start() {
     console.log(`[${getVietnamLogTime()}] Database initialized successfully`);
     
     // Run immediately on startup (optional - remove if you only want scheduled runs)
-    // await main().catch(err => console.error(`[${getVietnamLogTime()}] Startup run failed:`, err));
+    await main().catch(err => console.error(`[${getVietnamLogTime()}] Startup run failed:`, err));
     
     // Schedule job to run at specific Vietnam times: 0h, 3h, 6h, 9h, 12h, 15h, 18h, 21h (every 3 hours)
     // Using node-cron's built-in timezone support
