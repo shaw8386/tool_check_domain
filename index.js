@@ -1095,21 +1095,22 @@ function extractTextFromHTML(html, maxWords = 500) {
     // Remove hex colors and CSS-like values
     text = text.replace(/#[0-9a-fA-F]{3,6}/g, "");
     
-    // Clean up: remove extra whitespace, newlines, tabs, and special characters
+    // Clean up: remove extra whitespace, newlines, tabs
+    // Keep more characters to preserve meaningful text (including punctuation, Vietnamese characters, etc.)
     let cleaned = text
-      .replace(/[^\w\s\u00C0-\u1FFF\u2C00-\uD7FF]/g, " ") // Keep only word chars and unicode letters
       .replace(/\s+/g, " ")
       .replace(/\n+/g, " ")
+      .replace(/\t+/g, " ")
       .trim();
     
-    // Filter out words that look like code (e.g., camelCase, snake_case, UPPERCASE_WITH_UNDERSCORES)
+    // Filter out words that look like code, but be less aggressive
     const words = cleaned.split(/\s+/).filter(word => {
       if (word.length === 0) return false;
-      // Exclude words that are mostly code-like patterns
-      if (/^[A-Z_]+$/.test(word) && word.length > 5) return false; // UPPERCASE_CONSTANTS
-      if (/^[a-z]+[A-Z]/.test(word) && word.length > 10) return false; // camelCase
-      if (/^[a-z]+_[a-z]+/.test(word) && word.length > 10) return false; // snake_case
-      if (/^[0-9]+$/.test(word)) return false; // Pure numbers
+      // Only exclude obvious code patterns, keep most text
+      if (/^[A-Z_]+$/.test(word) && word.length > 10) return false; // Very long UPPERCASE_CONSTANTS
+      if (/^[a-z]+[A-Z][a-zA-Z]*[A-Z]/.test(word) && word.length > 15) return false; // Very long camelCase
+      if (/^[a-z]+_[a-z]+_[a-z]+/.test(word) && word.length > 15) return false; // Very long snake_case with multiple underscores
+      if (/^[0-9]+$/.test(word) && word.length > 5) return false; // Long pure numbers (keep short ones like years)
       return true;
     });
     
@@ -1164,9 +1165,20 @@ async function checkOnce({ url, proxyUrl, headers }) {
   // Extract content if status is 200
   if (res.status === 200 && res.data) {
     try {
-      content = extractTextFromHTML(res.data, 500);
+      if (typeof res.data === "string" && res.data.length > 0) {
+        content = extractTextFromHTML(res.data, 500);
+        if (content && content.trim().length > 0) {
+          const wordCount = content.split(/\s+/).filter(w => w.length > 0).length;
+          console.log(`[${getVietnamLogTime()}] Extracted ${wordCount} words from ${url}`);
+        } else {
+          console.warn(`[${getVietnamLogTime()}] Content extraction returned empty for ${url} (HTML length: ${res.data.length})`);
+        }
+      } else {
+        console.warn(`[${getVietnamLogTime()}] No string data to extract content from ${url}`);
+      }
     } catch (error) {
       console.error(`[${getVietnamLogTime()}] Error processing content for ${url}:`, error.message);
+      content = "";
     }
   }
 
@@ -1373,6 +1385,12 @@ async function processRow(row) {
         statusFinal = "SUCCESS";
         // Capture content when status is 200
         content = result.content || "";
+        if (content) {
+          const wordCount = content.split(/\s+/).length;
+          console.log(`[${getVietnamLogTime()}] [SUCCESS] domain=${domain} status=200 content=${wordCount} words`);
+        } else {
+          console.log(`[${getVietnamLogTime()}] [SUCCESS] domain=${domain} status=200 but content extraction returned empty`);
+        }
         break;
       }
 
@@ -1415,15 +1433,25 @@ async function processRow(row) {
       const msg = String(err?.message || err);
       const code = err?.code || null;
 
-      // Preserve the last known HTTP status if we had one
-      // Only set to empty if this is the first attempt and we never got a status
-      // For network errors, we keep the last HTTP status we received (if any)
+      // Record error type as status for network/SSL errors when no HTTP status was received
+      // This ensures we always have some status recorded, even for network failures
       if (lastStatus === "" && slot === 1) {
-        // First attempt failed with network error - no HTTP status received
-        // Could use error code, but user wants HTTP status codes, so leave empty for true network errors
-        lastStatus = "";
+        // First attempt failed with network/SSL error - record error type
+        if (code === "CERT_HAS_EXPIRED" || code === "UNABLE_TO_VERIFY_LEAF_SIGNATURE" || 
+            code === "SELF_SIGNED_CERT_IN_CHAIN" || msg.includes("self-signed certificate") ||
+            msg.includes("certificate")) {
+          lastStatus = "SSL_ERROR";
+        } else if (code === "ETIMEDOUT" || code === "ECONNABORTED" || msg.includes("timeout")) {
+          lastStatus = "TIMEOUT";
+        } else if (code === "ECONNREFUSED" || code === "ENOTFOUND" || msg.includes("refused") || msg.includes("not found")) {
+          lastStatus = "CONNECTION_ERROR";
+        } else if (code === "ECONNRESET" || msg.includes("socket") || msg.includes("disconnected")) {
+          lastStatus = "NETWORK_ERROR";
+        } else {
+          lastStatus = "ERROR";
+        }
       }
-      // Otherwise, keep the lastStatus from previous attempts (don't overwrite)
+      // Otherwise, keep the lastStatus from previous attempts (don't overwrite HTTP status codes)
       
       lastUrl = currentUrl;
 
