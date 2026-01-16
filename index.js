@@ -4,7 +4,6 @@ import pkg from "pg";
 import cron from "node-cron";
 import * as cheerio from "cheerio";
 
-
 const { Pool } = pkg;
 
 /**
