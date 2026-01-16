@@ -1107,39 +1107,20 @@ async function checkOnce({ url, proxyUrl, headers }) {
   };
 }
 
-/** =========================
- *  Google Sheets API (Apps Script)
- *  ========================= */
+/**
+ * Read input from Apps Script:
+ * GET {GS_API_URL}?action=input&token=...&inputSpreadsheetId=...
+ * Expect: { ok:true, rows:[{Domain,...}] }
+ */
 async function getInputRows() {
   let url = `${GS_API_URL}?action=input&token=${encodeURIComponent(GS_TOKEN)}`;
+  
+  // Add input spreadsheet ID if provided
   if (GS_INPUT_SPREADSHEET_ID) {
     url += `&inputSpreadsheetId=${encodeURIComponent(GS_INPUT_SPREADSHEET_ID)}`;
   }
-
-  console.log(`[${getVietnamLogTime()}] GS GET: ${url.replace(GS_TOKEN, "***")}`);
-
-  const res = await axios.get(url, {
-    timeout: 20000,
-    maxRedirects: 0,
-    validateStatus: () => true,
-    headers: {
-      "Accept": "application/json,text/plain,*/*",
-      "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
-    }
-  });
-
-  const ct = (res.headers?.["content-type"] || "").toLowerCase();
-
-  if (res.status >= 300 && res.status < 400) {
-    const loc = res.headers?.location || "";
-    throw new Error(`GS input redirect ${res.status} -> ${loc}`);
-  }
-
-  if (!ct.includes("application/json")) {
-    const preview = typeof res.data === "string" ? res.data.slice(0, 200) : JSON.stringify(res.data).slice(0, 200);
-    throw new Error(`GS input non-JSON response. ct=${ct} preview=${preview}`);
-  }
-
+  
+  const res = await axios.get(url, { timeout: 20000 });
   if (!res.data?.ok) throw new Error(res.data?.error || "GS input error");
   return res.data.rows || [];
 }
@@ -1434,22 +1415,35 @@ async function processRowsInParallel(rows) {
 async function main() {
   console.log(`[${getVietnamLogTime()}] Starting domain check process...`);
   console.log(`[${getVietnamLogTime()}] Concurrency limit: ${CONCURRENCY_LIMIT} rows at a time`);
+  
+  try {
+    const rows = await getInputRows();
+    console.log(`[${getVietnamLogTime()}] Retrieved ${rows.length} rows from Google Sheets`);
+    
+    if (rows.length > 0) {
+      // Log sample 1 row (ẩn proxy password)
+      const sampleRow = { ...rows[0] };
+      if (sampleRow.Proxy_IP_PORT_USER_PASS) {
+        sampleRow.Proxy_IP_PORT_USER_PASS = "***MASKED***";
+      }
+    
+      console.log(
+        `[${getVietnamLogTime()}] Sample input row[0]:`,
+        sampleRow
+      );
+    }
+    
+    // Process rows in parallel with concurrency limit
+    const output = await processRowsInParallel(rows);
 
-  const rows = await getInputRows();
-  console.log(`[${getVietnamLogTime()}] Retrieved ${rows.length} rows from Google Sheets`);
+    const sheetName = vnSheetName(getVietnamDate());
+    await postOutput(sheetName, output);
 
-  if (rows.length > 0) {
-    const sampleRow = { ...rows[0] };
-    if (sampleRow.Proxy_IP_PORT_USER_PASS) sampleRow.Proxy_IP_PORT_USER_PASS = "***MASKED***";
-    console.log(`[${getVietnamLogTime()}] Sample input row[0]:`, sampleRow);
+    console.log(`[${getVietnamLogTime()}] DONE outputSheet=${sheetName} rows=${output.length}`);
+  } catch (error) {
+    console.error(`[${getVietnamLogTime()}] Error in main process:`, error);
+    throw error;
   }
-
-  const output = await processRowsInParallel(rows);
-
-  const sheetName = vnSheetName(getVietnamDate());
-  await postOutput(sheetName, output);
-
-  console.log(`[${getVietnamLogTime()}] DONE outputSheet=${sheetName} rows=${output.length}`);
 }
 
 /** =========================
