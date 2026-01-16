@@ -342,6 +342,20 @@ async function checkOnce({ url, proxyUrl, headers }) {
     httpAgent: agent,
     responseType: "text" // Get response as text for HTML parsing
   });
+  const ct = res.headers?.["content-type"] || "";
+  const loc = res.headers?.location || "";
+  let title = "";
+  let head = "";
+  
+  if (typeof res.data === "string") {
+    head = res.data.slice(0, 400).replace(/\s+/g, " ");
+    try {
+      const $ = cheerio.load(res.data);
+      title = ($("title").text() || "").trim();
+    } catch {}
+  }
+  
+  console.log(`[${getVietnamLogTime()}] [HTTP] url=${url} status=${res.status} ct=${ct} loc=${loc} title="${title}" head="${head}"`);
 
   let content = "";
   
@@ -647,13 +661,7 @@ async function main() {
   
   try {
     const rows = await getInputRows();
-    console.log(`[${getVietnamLogTime()}] Retrieved ${rows.length} rows from Google Sheets`);
     if (rows.length > 0) {
-      console.log(
-        `[${getVietnamLogTime()}] Input row keys:`,
-        Object.keys(rows[0])
-      );
-    
       // Log sample 1 row (ẩn proxy password)
       const sampleRow = { ...rows[0] };
       if (sampleRow.Proxy_IP_PORT_USER_PASS) {
