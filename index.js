@@ -745,6 +745,7 @@
 // start();
 
 
+// index.js
 import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import pkg from "pg";
@@ -755,21 +756,21 @@ const { Pool } = pkg;
 
 /**
  * ENV bắt buộc:
- * - GS_API_URL
- * - GS_TOKEN
- * - DATABASE_URL
+ * - GS_API_URL: URL Web App Apps Script (doGet/doPost)
+ * - GS_TOKEN: token secret để auth
+ * - DATABASE_URL: Postgres connection string (Railway provides this)
  *
  * ENV khuyến nghị:
- * - GS_INPUT_SPREADSHEET_ID
- * - GS_OUTPUT_SPREADSHEET_ID
+ * - GS_INPUT_SPREADSHEET_ID: Spreadsheet ID input
+ * - GS_OUTPUT_SPREADSHEET_ID: Spreadsheet ID output
  *
  * Tuỳ chọn:
- * - DEFAULT_MAX_SLOTS (default 3)
- * - DEFAULT_MAXTIME_TRY_SECONDS (default 10)
- * - REQUEST_TIMEOUT_MS (default 15000)
- * - MAX_REDIRECT_FIX (default 3)
- * - CONCURRENCY_LIMIT (default 5)
- * - CRON_SCHEDULE (default: "0 0,3,6,9,12,15,18,21 * * *" theo giờ VN)
+ * - DEFAULT_MAX_SLOTS: fallback nếu sheet thiếu Max Slot try (default 3)
+ * - DEFAULT_MAXTIME_TRY_SECONDS: fallback nếu sheet thiếu Maxtime try (default 10)
+ * - REQUEST_TIMEOUT_MS: timeout mỗi request (default 15000)
+ * - MAX_REDIRECT_FIX: giới hạn số lần tự "fix redirect" (default 3)
+ * - CONCURRENCY_LIMIT: số row xử lý song song (default 5)
+ * - CRON_SCHEDULE: cron chạy theo giờ VN (default: "0 0,3,6,9,12,15,18,21 * * *")
  */
 
 const GS_API_URL = process.env.GS_API_URL;
@@ -785,7 +786,7 @@ const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || "15000", 1
 const MAX_REDIRECT_FIX = parseInt(process.env.MAX_REDIRECT_FIX || "3", 10);
 const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT || "5", 10);
 
-// Cron chạy 00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00, 21:00 theo giờ VN
+// Cron cố định theo giờ VN (00:00,03:00,06:00,09:00,12:00,15:00,18:00,21:00)
 const CRON_SCHEDULE = process.env.CRON_SCHEDULE || "0 0,3,6,9,12,15,18,21 * * *";
 
 if (!GS_API_URL || !GS_TOKEN) {
@@ -796,6 +797,12 @@ if (!DATABASE_URL) {
   console.error("Missing DATABASE_URL env");
   process.exit(1);
 }
+if (!GS_INPUT_SPREADSHEET_ID) {
+  console.warn("Warning: GS_INPUT_SPREADSHEET_ID not set. Will rely on Apps Script properties.");
+}
+if (!GS_OUTPUT_SPREADSHEET_ID) {
+  console.warn("Warning: GS_OUTPUT_SPREADSHEET_ID not set. Will rely on Apps Script properties.");
+}
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -804,7 +811,9 @@ const pool = new Pool({
 
 const VIETNAM_TIMEZONE = "Asia/Ho_Chi_Minh";
 
-/* -------------------- TIME (VN) -------------------- */
+/** =========================
+ *  Vietnam time helpers
+ *  ========================= */
 function getVietnamDateParts(date = new Date()) {
   const formatter = new Intl.DateTimeFormat("en-US", {
     timeZone: VIETNAM_TIMEZONE,
@@ -833,7 +842,8 @@ function getVietnamDateParts(date = new Date()) {
 
 function getVietnamDate(date = new Date()) {
   const p = getVietnamDateParts(date);
-  return new Date(`${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}+07:00`);
+  const vnDateString = `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}:${p.second}`;
+  return new Date(vnDateString + "+07:00");
 }
 
 function getVietnamISOString(date = new Date()) {
@@ -847,7 +857,17 @@ function getVietnamLogTime(date = new Date()) {
 }
 
 function vnSheetName(date = new Date()) {
-  const p = getVietnamDateParts(date);
+  const p = new Intl.DateTimeFormat("en-US", {
+    timeZone: VIETNAM_TIMEZONE,
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  })
+    .formatToParts(date)
+    .reduce((acc, x) => ((acc[x.type] = x.value), acc), {});
   return `${p.hour}:${p.minute}_${p.month}/${p.day}/${p.year}`;
 }
 
@@ -855,21 +875,47 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/* -------------------- INPUT NORMALIZE -------------------- */
-/**
- * Sheet input của bạn đang có key có dấu cách:
- * - "Maxtime try"
- * - "Max Slot try"
- * Nên phải đọc linh hoạt.
- */
-function getRowValue(row, keys, fallback = "") {
+/** =========================
+ *  Sheet key helpers
+ *  - Vì sheet của bạn đang dùng header có khoảng trắng:
+ *    "Maxtime try", "Max Slot try"
+ *  ========================= */
+function pickFirst(obj, keys, fallback = "") {
   for (const k of keys) {
-    if (row && Object.prototype.hasOwnProperty.call(row, k)) {
-      const v = row[k];
-      if (v !== null && v !== undefined && String(v).trim() !== "") return v;
+    if (obj && Object.prototype.hasOwnProperty.call(obj, k) && obj[k] !== "" && obj[k] != null) {
+      return obj[k];
     }
   }
   return fallback;
+}
+
+/** =========================
+ *  Proxy helpers
+ *  ========================= */
+function parseProxy(proxyRaw) {
+  if (!proxyRaw) return null;
+  const s = String(proxyRaw).trim();
+  if (!s) return null;
+
+  if (s.startsWith("http://") || s.startsWith("https://")) return s;
+
+  // user:pass@ip:port
+  if (s.includes("@") && s.includes(":")) return "http://" + s;
+
+  // ip:port:user:pass
+  const parts = s.split(":");
+  if (parts.length === 4) {
+    const [ip, port, user, pass] = parts;
+    return `http://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${ip}:${port}`;
+  }
+
+  // ip:port
+  if (parts.length === 2) {
+    const [ip, port] = parts;
+    return `http://${ip}:${port}`;
+  }
+
+  return "http://" + s;
 }
 
 function normalizeDomain(domainRaw) {
@@ -885,7 +931,8 @@ function normalizeDomain(domainRaw) {
 }
 
 /**
- * Ưu tiên HTTP trước (proxy HTTP free thường fail HTTPS CONNECT)
+ * URL candidates:
+ * - Để proxy HTTP dễ sống, ưu tiên http trước rồi https.
  */
 function buildCandidateUrls(domain) {
   const host = normalizeDomain(domain);
@@ -907,36 +954,9 @@ function buildCandidateUrls(domain) {
   return [...new Set(urls)];
 }
 
-/* -------------------- PROXY -------------------- */
-function parseProxy(proxyRaw) {
-  if (!proxyRaw) return null;
-  const s = String(proxyRaw).trim();
-  if (!s) return null;
-
-  if (s.startsWith("http://") || s.startsWith("https://")) return s;
-
-  // user:pass@ip:port
-  if (s.includes("@") && s.includes(":")) {
-    return "http://" + s;
-  }
-
-  // ip:port:user:pass
-  const parts = s.split(":");
-  if (parts.length === 4) {
-    const [ip, port, user, pass] = parts;
-    return `http://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@${ip}:${port}`;
-  }
-
-  // ip:port
-  if (parts.length === 2) {
-    const [ip, port] = parts;
-    return `http://${ip}:${port}`;
-  }
-
-  return "http://" + s;
-}
-
-/* -------------------- FIX PLAN -------------------- */
+/** =========================
+ *  Fix plan theo status / lỗi network
+ *  ========================= */
 function getFixPlan({ status, errorCode, currentUrl, domain, redirectLocation }) {
   const plan = { extraDelayMs: 0, headers: null, nextUrls: [] };
 
@@ -950,7 +970,6 @@ function getFixPlan({ status, errorCode, currentUrl, domain, redirectLocation })
     "Pragma": "no-cache"
   };
 
-  // network/timeouts
   if (errorCode === "ETIMEDOUT" || errorCode === "ECONNABORTED") {
     plan.extraDelayMs = 2000;
     plan.headers = browserHeaders;
@@ -978,6 +997,7 @@ function getFixPlan({ status, errorCode, currentUrl, domain, redirectLocation })
     return plan;
   }
 
+  // 3xx: FAIL nhưng xử lí = follow Location
   if (status >= 300 && status <= 399 && redirectLocation) {
     try {
       const resolved = new URL(redirectLocation, currentUrl).toString();
@@ -1001,33 +1021,44 @@ function getFixPlan({ status, errorCode, currentUrl, domain, redirectLocation })
   return plan;
 }
 
-/* -------------------- CONTENT EXTRACT (LESS AGGRESSIVE) -------------------- */
-/**
- * Bản extractor trước bạn lọc quá gắt => dễ ra rỗng.
- * Bản này đơn giản, ổn định:
- * - remove script/style/noscript/iframe
- * - lấy text body
- * - gom whitespace
- * - cắt maxWords
- */
-function extractTextFromHTML(html, maxWords = 300) {
+/** =========================
+ *  Extract text (chỉ dùng khi title rỗng)
+ *  ========================= */
+function extractTextFromHTML(html, maxWords = 120) {
   try {
     if (!html || typeof html !== "string") return "";
     const $ = cheerio.load(html);
 
-    $("script, style, noscript, iframe, embed, object").remove();
+    $("script, style, noscript, iframe, embed, object, code, pre").remove();
 
-    const bodyText = ($("body").text() || $("html").text() || "").replace(/\s+/g, " ").trim();
-    if (!bodyText) return "";
+    let text = "";
+    const mainContent = $("main, article, [role='main'], .content, .main, #content, #main").first();
+    if (mainContent.length > 0) text = mainContent.text();
+    else text = $("body").text() || $("html").text() || "";
 
-    const words = bodyText.split(/\s+/).filter(Boolean);
+    text = text
+      .replace(/&nbsp;/g, " ")
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'");
+
+    text = text.replace(/\s+/g, " ").trim();
+
+    const words = text.split(/\s+/).filter((w) => w && w.length > 0);
     return words.slice(0, maxWords).join(" ");
-  } catch {
+  } catch (e) {
+    console.error(`[${getVietnamLogTime()}] Error extracting text: ${e?.message || e}`);
     return "";
   }
 }
 
-/* -------------------- HTTP CHECK -------------------- */
+/** =========================
+ *  HTTP check once
+ *  - Always returns status
+ *  - Returns content_domain = title || (content if title empty)
+ *  ========================= */
 async function checkOnce({ url, proxyUrl, headers }) {
   const agent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
 
@@ -1046,9 +1077,9 @@ async function checkOnce({ url, proxyUrl, headers }) {
 
   const ct = res.headers?.["content-type"] || "";
   const loc = res.headers?.location || "";
+
   let title = "";
   let head = "";
-
   if (typeof res.data === "string") {
     head = res.data.slice(0, 250).replace(/\s+/g, " ");
     try {
@@ -1061,29 +1092,54 @@ async function checkOnce({ url, proxyUrl, headers }) {
     `[${getVietnamLogTime()}] [HTTP] url=${url} status=${res.status} ct=${ct} loc=${loc} title="${title}" head="${head}"`
   );
 
-  // Chỉ lấy content nếu title rỗng
   let content_domain = title;
 
-  if (res.status === 200 && !content_domain && typeof res.data === "string") {
-    const content = extractTextFromHTML(res.data, 120); // lấy ít thôi
+  // Chỉ lấy content nếu status=200 và title rỗng
+  if (res.status === 200 && !content_domain && typeof res.data === "string" && res.data.length) {
+    const content = extractTextFromHTML(res.data, 120);
     if (content && content.trim()) content_domain = content;
   }
 
   return {
     status: res.status,
     redirectLocation: loc || null,
-    content_domain // <= output cuối cùng bạn cần
+    content_domain
   };
 }
 
-/* -------------------- GOOGLE SHEETS API -------------------- */
+/** =========================
+ *  Google Sheets API (Apps Script)
+ *  ========================= */
 async function getInputRows() {
   let url = `${GS_API_URL}?action=input&token=${encodeURIComponent(GS_TOKEN)}`;
   if (GS_INPUT_SPREADSHEET_ID) {
     url += `&inputSpreadsheetId=${encodeURIComponent(GS_INPUT_SPREADSHEET_ID)}`;
   }
 
-  const res = await axios.get(url, { timeout: 20000 });
+  console.log(`[${getVietnamLogTime()}] GS GET: ${url.replace(GS_TOKEN, "***")}`);
+
+  const res = await axios.get(url, {
+    timeout: 20000,
+    maxRedirects: 0,
+    validateStatus: () => true,
+    headers: {
+      "Accept": "application/json,text/plain,*/*",
+      "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+    }
+  });
+
+  const ct = (res.headers?.["content-type"] || "").toLowerCase();
+
+  if (res.status >= 300 && res.status < 400) {
+    const loc = res.headers?.location || "";
+    throw new Error(`GS input redirect ${res.status} -> ${loc}`);
+  }
+
+  if (!ct.includes("application/json")) {
+    const preview = typeof res.data === "string" ? res.data.slice(0, 200) : JSON.stringify(res.data).slice(0, 200);
+    throw new Error(`GS input non-JSON response. ct=${ct} preview=${preview}`);
+  }
+
   if (!res.data?.ok) throw new Error(res.data?.error || "GS input error");
   return res.data.rows || [];
 }
@@ -1112,10 +1168,13 @@ async function postOutput(sheetName, data) {
   return res.data;
 }
 
-/* -------------------- POSTGRES -------------------- */
+/** =========================
+ *  Database
+ *  - Không lưu title/content/content_len
+ *  ========================= */
 async function initDatabase() {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS domain_checks (
+    CREATE TABLE IF NOT EXISTS domain_checks_new (
       id SERIAL PRIMARY KEY,
       domain VARCHAR(255) NOT NULL,
       isp VARCHAR(255),
@@ -1127,8 +1186,8 @@ async function initDatabase() {
     );
   `);
 
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_domain_checks_domain ON domain_checks(domain);`);
-  await pool.query(`CREATE INDEX IF NOT EXISTS idx_domain_checks_update_time ON domain_checks(update_time);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_domain_checks_new_domain ON domain_checks_new(domain);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_domain_checks_new_update_time ON domain_checks_new(update_time);`);
 
   console.log(`[${getVietnamLogTime()}] Database schema initialized`);
 }
@@ -1137,7 +1196,7 @@ async function saveToDatabase(result) {
   try {
     const vnDate = getVietnamDate();
     await pool.query(
-      `INSERT INTO domain_checks (domain, isp, dns, update_time, status_http, status_final)
+      `INSERT INTO domain_checks_new (domain, isp, dns, update_time, status_http, status_final)
        VALUES ($1,$2,$3,$4,$5,$6)`,
       [
         result.Domain || "",
@@ -1149,59 +1208,30 @@ async function saveToDatabase(result) {
       ]
     );
   } catch (error) {
-    console.error(`[${getVietnamLogTime()}] Error saving to DB domain=${result.Domain}: ${error?.message || error}`);
+    console.error(
+      `[${getVietnamLogTime()}] Error saving to DB domain=${result.Domain}: ${error?.message || error}`
+    );
   }
 }
 
-/* -------------------- CORE PROCESS -------------------- */
-function mapInputRow(row) {
-  // hỗ trợ cả tên cột có dấu cách và dạng underscore
-  const domain = getRowValue(row, ["Domain", "domain"], "");
-  const proxy = getRowValue(row, ["Proxy_IP_PORT_USER_PASS", "Proxy", "proxy"], "");
-  const isp = getRowValue(row, ["ISP", "isp"], "");
-  const dns = getRowValue(row, ["DNS", "dns"], "");
-
-  const maxtimeTry = getRowValue(row, ["Maxtime try", "Maxtime_try", "Maxtime", "maxtime_try"], "");
-  const maxSlotTry = getRowValue(row, ["Max Slot try", "Max_Slot_try", "MaxSlot", "max_slot_try"], "");
-
-  return {
-    Domain: domain,
-    Proxy_IP_PORT_USER_PASS: proxy,
-    ISP: isp,
-    DNS: dns,
-    _MaxtimeTryRaw: maxtimeTry,
-    _MaxSlotTryRaw: maxSlotTry
-  };
-}
-
-function detectNetworkStatus(err) {
-  const msg = String(err?.message || err);
-  const code = err?.code || "";
-
-  if (
-    code === "CERT_HAS_EXPIRED" ||
-    code === "UNABLE_TO_VERIFY_LEAF_SIGNATURE" ||
-    code === "SELF_SIGNED_CERT_IN_CHAIN" ||
-    msg.toLowerCase().includes("certificate")
-  ) return "SSL_ERROR";
-
-  if (code === "ETIMEDOUT" || code === "ECONNABORTED" || msg.toLowerCase().includes("timeout")) return "TIMEOUT";
-  if (code === "ECONNREFUSED" || code === "ENOTFOUND") return "CONNECTION_ERROR";
-  if (code === "ECONNRESET") return "NETWORK_ERROR";
-  return "ERROR";
-}
-
-async function processRow(rawRow) {
-  const row = mapInputRow(rawRow);
-
+/** =========================
+ *  Core per-row process
+ *  ========================= */
+async function processRow(row) {
   const domain = String(row.Domain || "").trim();
-  const proxyUrl = parseProxy(row.Proxy_IP_PORT_USER_PASS);
+  const proxyRaw = row.Proxy_IP_PORT_USER_PASS;
+  const proxyUrl = parseProxy(proxyRaw);
 
-  const isp = row.ISP || "";
-  const dns = row.DNS || "";
+  const isp = row.ISP ?? "";
+  const dns = row.DNS ?? "";
 
-  const maxSlots = parseInt(row._MaxSlotTryRaw || DEFAULT_MAX_SLOTS, 10);
-  const maxTimeTrySec = parseInt(row._MaxtimeTryRaw || DEFAULT_MAXTIME_TRY_SECONDS, 10);
+  // đọc cả 2 kiểu header: có dấu _ hoặc có khoảng trắng
+  const maxSlotsRaw = pickFirst(row, ["Max_Slot_try", "Max Slot try"], DEFAULT_MAX_SLOTS);
+  const maxTimeRaw = pickFirst(row, ["Maxtime_try", "Maxtime try"], DEFAULT_MAXTIME_TRY_SECONDS);
+
+  const maxSlots = parseInt(maxSlotsRaw || DEFAULT_MAX_SLOTS, 10);
+  const maxTimeTrySec = parseInt(maxTimeRaw || DEFAULT_MAXTIME_TRY_SECONDS, 10);
+
   const baseDelayMs = maxTimeTrySec * 1000 + 5000;
 
   const candidates = buildCandidateUrls(domain);
@@ -1210,45 +1240,45 @@ async function processRow(rawRow) {
       Domain: domain,
       ISP: isp,
       DNS: dns,
-      StatusHTTP: "INVALID_DOMAIN",
+      StatusHTTP: "",
       StatusFinal: "FAIL",
-      Title: "",
-      ContentLen: 0,
-      Content: ""
+      ContentDomain: "",
+      LastURL: ""
     };
   }
+
+  let tried = 0;
+  let lastStatus = "";
+  let lastUrl = candidates[0];
+  let statusFinal = "FAIL";
+  let contentDomain = "";
 
   let currentUrl = candidates[0];
   let currentHeaders = null;
 
-  let lastStatus = "";
-  let lastUrl = currentUrl;
-  let statusFinal = "FAIL";
-
-  let content = "";
-  let title = "";
-  let contentLen = 0;
-
   let redirectFixCount = 0;
 
   for (let slot = 1; slot <= maxSlots; slot++) {
+    tried = slot;
     console.log(
       `[${getVietnamLogTime()}] Try slot ${slot}/${maxSlots} domain=${domain} url=${currentUrl} proxy=${proxyUrl ? "YES" : "NO"}`
     );
 
     try {
-      const result = await checkOnce({ url: currentUrl, proxyUrl, headers: currentHeaders });
+      const result = await checkOnce({
+        url: currentUrl,
+        proxyUrl,
+        headers: currentHeaders
+      });
 
       lastStatus = String(result.status);
       lastUrl = currentUrl;
 
-      let contentDomain = "";
-      
       if (result.status === 200) {
         statusFinal = "SUCCESS";
         contentDomain = result.content_domain || "";
         console.log(
-          `[${getVietnamLogTime()}] [SUCCESS] domain=${domain} status=200 content_domain="${contentDomain ? contentDomain.slice(0, 80) : ""}"`
+          `[${getVietnamLogTime()}] [SUCCESS] domain=${domain} status=200 content_domain="${contentDomain ? contentDomain.slice(0, 100) : ""}"`
         );
         break;
       }
@@ -1280,13 +1310,34 @@ async function processRow(rawRow) {
       }
 
       const waitMs = baseDelayMs + (fixPlan.extraDelayMs || 0);
-      if (slot < maxSlots) await sleep(waitMs);
+      if (slot < maxSlots) {
+        console.log(`[${getVietnamLogTime()}] Wait ${Math.round(waitMs / 1000)}s then retry domain=${domain}`);
+        await sleep(waitMs);
+      }
     } catch (err) {
-      const code = err?.code || "";
       const msg = String(err?.message || err);
+      const code = err?.code || null;
 
-      // luôn có status để output không bị trống
-      if (!lastStatus) lastStatus = detectNetworkStatus(err);
+      // nếu chưa có lastStatus (lần đầu) thì set lỗi để sheet không trống
+      if (!lastStatus) {
+        if (
+          code === "CERT_HAS_EXPIRED" ||
+          code === "UNABLE_TO_VERIFY_LEAF_SIGNATURE" ||
+          code === "SELF_SIGNED_CERT_IN_CHAIN" ||
+          msg.toLowerCase().includes("certificate")
+        ) {
+          lastStatus = "SSL_ERROR";
+        } else if (code === "ETIMEDOUT" || code === "ECONNABORTED" || msg.toLowerCase().includes("timeout")) {
+          lastStatus = "TIMEOUT";
+        } else if (code === "ECONNREFUSED" || code === "ENOTFOUND") {
+          lastStatus = "CONNECTION_ERROR";
+        } else if (code === "ECONNRESET") {
+          lastStatus = "NETWORK_ERROR";
+        } else {
+          lastStatus = "ERROR";
+        }
+      }
+
       lastUrl = currentUrl;
 
       const fixPlan = getFixPlan({
@@ -1301,12 +1352,15 @@ async function processRow(rawRow) {
       if (fixPlan.nextUrls?.length) currentUrl = fixPlan.nextUrls[0];
 
       const waitMs = baseDelayMs + (fixPlan.extraDelayMs || 0);
-      if (slot < maxSlots) await sleep(waitMs);
+      if (slot < maxSlots) {
+        console.log(`[${getVietnamLogTime()}] Wait ${Math.round(waitMs / 1000)}s then retry domain=${domain}`);
+        await sleep(waitMs);
+      }
 
       if (slot === maxSlots) statusFinal = "FAIL";
 
       console.error(
-        `[${getVietnamLogTime()}] [FAIL] domain=${domain} slot=${slot}/${maxSlots} url=${currentUrl} proxy=${proxyUrl ? "YES" : "NO"} err=${msg} lastStatus=${lastStatus}`
+        `[${getVietnamLogTime()}] [FAIL] domain=${domain} slot=${slot}/${maxSlots} url=${currentUrl} proxy=${proxyUrl ? "YES" : "NO"} err=${msg} lastStatus=${lastStatus || "none"}`
       );
     }
   }
@@ -1315,13 +1369,17 @@ async function processRow(rawRow) {
     Domain: domain,
     ISP: isp,
     DNS: dns,
-    StatusHTTP: lastStatus || "",
+    StatusHTTP: lastStatus,
     StatusFinal: statusFinal,
-    ContentDomain: contentDomain || "",
+    ContentDomain: contentDomain,
+    TriedCount: tried,
     LastURL: lastUrl
   };
 }
 
+/** =========================
+ *  Parallel processing with concurrency limit
+ *  ========================= */
 async function processRowsInParallel(rows) {
   const results = [];
 
@@ -1334,27 +1392,30 @@ async function processRowsInParallel(rows) {
 
     const batchPromises = batch.map(async (row, batchIndex) => {
       const globalIndex = i + batchIndex + 1;
-      const d = row?.Domain || row?.domain || "N/A";
-      console.log(`[${getVietnamLogTime()}] Processing row ${globalIndex}/${rows.length}: ${d}`);
+      console.log(`[${getVietnamLogTime()}] Processing row ${globalIndex}/${rows.length}: ${row.Domain || "N/A"}`);
 
       try {
-        const r = await processRow(row);
-        await saveToDatabase(r);
-        return r;
-      } catch (e) {
-        console.error(`[${getVietnamLogTime()}] Error processing row ${globalIndex} (${d}): ${e?.message || e}`);
-        const fail = {
-          Domain: String(d || ""),
-          ISP: row?.ISP || "",
-          DNS: row?.DNS || "",
+        const result = await processRow(row);
+        await saveToDatabase(result);
+        return result;
+      } catch (error) {
+        console.error(
+          `[${getVietnamLogTime()}] Error processing row ${globalIndex} (${row.Domain || "N/A"}): ${error?.message || error}`
+        );
+
+        const failed = {
+          Domain: row.Domain || "",
+          ISP: row.ISP || "",
+          DNS: row.DNS || "",
           StatusHTTP: "ERROR",
           StatusFinal: "FAIL",
-          Title: "",
-          ContentLen: 0,
-          Content: ""
+          ContentDomain: "",
+          TriedCount: 0,
+          LastURL: ""
         };
-        await saveToDatabase(fail);
-        return fail;
+
+        await saveToDatabase(failed);
+        return failed;
       }
     });
 
@@ -1367,6 +1428,9 @@ async function processRowsInParallel(rows) {
   return results;
 }
 
+/** =========================
+ *  Main
+ *  ========================= */
 async function main() {
   console.log(`[${getVietnamLogTime()}] Starting domain check process...`);
   console.log(`[${getVietnamLogTime()}] Concurrency limit: ${CONCURRENCY_LIMIT} rows at a time`);
@@ -1375,9 +1439,9 @@ async function main() {
   console.log(`[${getVietnamLogTime()}] Retrieved ${rows.length} rows from Google Sheets`);
 
   if (rows.length > 0) {
-    const sample = { ...rows[0] };
-    if (sample.Proxy_IP_PORT_USER_PASS) sample.Proxy_IP_PORT_USER_PASS = "***MASKED***";
-    console.log(`[${getVietnamLogTime()}] Sample input row[0]:`, sample);
+    const sampleRow = { ...rows[0] };
+    if (sampleRow.Proxy_IP_PORT_USER_PASS) sampleRow.Proxy_IP_PORT_USER_PASS = "***MASKED***";
+    console.log(`[${getVietnamLogTime()}] Sample input row[0]:`, sampleRow);
   }
 
   const output = await processRowsInParallel(rows);
@@ -1388,20 +1452,20 @@ async function main() {
   console.log(`[${getVietnamLogTime()}] DONE outputSheet=${sheetName} rows=${output.length}`);
 }
 
-/* -------------------- START -------------------- */
+/** =========================
+ *  Start + Schedule
+ *  ========================= */
 async function start() {
   try {
     await initDatabase();
     console.log(`[${getVietnamLogTime()}] Database initialized successfully`);
 
-    // chạy ngay 1 lần khi start (để test)
-    await main().catch((err) =>
-      console.error(`[${getVietnamLogTime()}] Startup run failed: ${err?.message || err}`)
-    );
+    // chạy ngay khi start để test
+    await main().catch((err) => console.error(`[${getVietnamLogTime()}] Startup run failed: ${err?.message || err}`));
 
     console.log(`[${getVietnamLogTime()}] Scheduling job with cron: ${CRON_SCHEDULE} (Vietnam timezone)`);
     console.log(
-      `[${getVietnamLogTime()}] Will run at: 00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00, 21:00 (VN)`
+      `[${getVietnamLogTime()}] Will run at: 00:00, 03:00, 06:00, 09:00, 12:00, 15:00, 18:00, 21:00 (Vietnam time)`
     );
 
     cron.schedule(
@@ -1437,4 +1501,5 @@ async function start() {
 }
 
 start();
+
 
