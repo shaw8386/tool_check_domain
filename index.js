@@ -299,7 +299,7 @@ function extractTextFromHTML(html, maxWords = 100) {
     const $ = cheerio.load(html);
     
     // Remove script, style, and other non-content elements
-    $("script, style, noscript, iframe, embed, object").remove();
+    $("script, style").remove();
     
     // Get text content
     const text = $("body").text() || $("html").text() || "";
