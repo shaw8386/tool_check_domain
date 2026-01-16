@@ -537,6 +537,9 @@ async function processRow(row) {
 
   for (let slot = 1; slot <= maxSlots; slot++) {
     tried = slot;
+    console.log(
+      `[${getVietnamLogTime()}] Try slot ${slot}/${maxSlots} domain=${domain} url=${currentUrl} proxy=${proxyUrl ? "YES" : "NO"}`
+    );
 
     try {
       const result = await checkOnce({
@@ -645,7 +648,23 @@ async function main() {
   try {
     const rows = await getInputRows();
     console.log(`[${getVietnamLogTime()}] Retrieved ${rows.length} rows from Google Sheets`);
-
+    if (rows.length > 0) {
+      console.log(
+        `[${getVietnamLogTime()}] Input row keys:`,
+        Object.keys(rows[0])
+      );
+    
+      // Log sample 1 row (ẩn proxy password)
+      const sampleRow = { ...rows[0] };
+      if (sampleRow.Proxy_IP_PORT_USER_PASS) {
+        sampleRow.Proxy_IP_PORT_USER_PASS = "***MASKED***";
+      }
+    
+      console.log(
+        `[${getVietnamLogTime()}] Sample input row[0]:`,
+        sampleRow
+      );
+    }
     const output = [];
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
