@@ -1050,7 +1050,7 @@ async function checkOnce({ url, proxyUrl, headers }) {
   let head = "";
 
   if (typeof res.data === "string") {
-    head = res.data.slice(0, 300).replace(/\s+/g, " ");
+    head = res.data.slice(0, 250).replace(/\s+/g, " ");
     try {
       const $ = cheerio.load(res.data);
       title = ($("title").text() || "").trim();
@@ -1061,20 +1061,18 @@ async function checkOnce({ url, proxyUrl, headers }) {
     `[${getVietnamLogTime()}] [HTTP] url=${url} status=${res.status} ct=${ct} loc=${loc} title="${title}" head="${head}"`
   );
 
-  let content = "";
-  let contentLen = 0;
+  // Chỉ lấy content nếu title rỗng
+  let content_domain = title;
 
-  if (res.status === 200 && typeof res.data === "string") {
-    contentLen = res.data.length;
-    content = extractTextFromHTML(res.data, 300);
+  if (res.status === 200 && !content_domain && typeof res.data === "string") {
+    const content = extractTextFromHTML(res.data, 120); // lấy ít thôi
+    if (content && content.trim()) content_domain = content;
   }
 
   return {
     status: res.status,
     redirectLocation: loc || null,
-    content,
-    title,
-    contentLen
+    content_domain // <= output cuối cùng bạn cần
   };
 }
 
@@ -1095,7 +1093,7 @@ async function postOutput(sheetName, data) {
     action: "output",
     token: GS_TOKEN,
     sheetName,
-    headers: ["Domain", "ISP", "DNS", "Update", "StatusHTTP", "StatusFinal", "Title", "ContentLen", "Content"],
+    headers: ["Domain", "ISP", "DNS", "Update", "StatusHTTP", "StatusFinal", "ContentDomain"],
     data: data.map((row) => ({
       Domain: row.Domain || "",
       ISP: row.ISP || "",
@@ -1103,9 +1101,7 @@ async function postOutput(sheetName, data) {
       Update: getVietnamISOString(),
       StatusHTTP: row.StatusHTTP != null ? String(row.StatusHTTP) : "",
       StatusFinal: row.StatusFinal || "FAIL",
-      Title: row.Title || "",
-      ContentLen: row.ContentLen != null ? String(row.ContentLen) : "0",
-      Content: row.Content || ""
+      ContentDomain: row.ContentDomain || ""
     }))
   };
 
@@ -1127,15 +1123,12 @@ async function initDatabase() {
       update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       status_http VARCHAR(50),
       status_final VARCHAR(10) NOT NULL,
-      title TEXT,
-      content_len INTEGER DEFAULT 0,
-      content TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
-
-    CREATE INDEX IF NOT EXISTS idx_domain_checks_domain ON domain_checks(domain);
-    CREATE INDEX IF NOT EXISTS idx_domain_checks_update_time ON domain_checks(update_time);
   `);
+
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_domain_checks_domain ON domain_checks(domain);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_domain_checks_update_time ON domain_checks(update_time);`);
 
   console.log(`[${getVietnamLogTime()}] Database schema initialized`);
 }
@@ -1144,18 +1137,15 @@ async function saveToDatabase(result) {
   try {
     const vnDate = getVietnamDate();
     await pool.query(
-      `INSERT INTO domain_checks (domain, isp, dns, update_time, status_http, status_final, title, content_len, content)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      `INSERT INTO domain_checks (domain, isp, dns, update_time, status_http, status_final)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
       [
         result.Domain || "",
         result.ISP || "",
         result.DNS || "",
         vnDate,
         result.StatusHTTP != null ? String(result.StatusHTTP) : "",
-        result.StatusFinal || "FAIL",
-        result.Title || "",
-        parseInt(result.ContentLen || 0, 10) || 0,
-        result.Content || ""
+        result.StatusFinal || "FAIL"
       ]
     );
   } catch (error) {
@@ -1252,14 +1242,13 @@ async function processRow(rawRow) {
       lastStatus = String(result.status);
       lastUrl = currentUrl;
 
+      let contentDomain = "";
+      
       if (result.status === 200) {
         statusFinal = "SUCCESS";
-        content = result.content || "";
-        title = result.title || "";
-        contentLen = result.contentLen || 0;
-
+        contentDomain = result.content_domain || "";
         console.log(
-          `[${getVietnamLogTime()}] [SUCCESS] domain=${domain} status=200 title="${title}" contentLen=${contentLen} extractedWords=${content ? content.split(/\s+/).length : 0}`
+          `[${getVietnamLogTime()}] [SUCCESS] domain=${domain} status=200 content_domain="${contentDomain ? contentDomain.slice(0, 80) : ""}"`
         );
         break;
       }
@@ -1328,9 +1317,7 @@ async function processRow(rawRow) {
     DNS: dns,
     StatusHTTP: lastStatus || "",
     StatusFinal: statusFinal,
-    Title: title || "",
-    ContentLen: contentLen || 0,
-    Content: content || "",
+    ContentDomain: contentDomain || "",
     LastURL: lastUrl
   };
 }
