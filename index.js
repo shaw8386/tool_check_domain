@@ -384,7 +384,7 @@ async function postOutput(sheetName, data) {
     action: "output",
     token: GS_TOKEN,
     sheetName,
-    headers: ["Domain", "ISP", "DNS", "Update", "StatusHTTP", "StatusFinal", "ContentDomain"],
+    headers: ["Domain", "ISP", "DNS", "Update", "StatusHTTP", "StatusFinal", "URL", "ContentDomain"],
     data: data.map((row) => ({
       Domain: row.Domain || "",
       ISP: row.ISP || "",
@@ -392,6 +392,7 @@ async function postOutput(sheetName, data) {
       Update: getVietnamISOString(),
       StatusHTTP: row.StatusHTTP != null ? String(row.StatusHTTP) : "",
       StatusFinal: row.StatusFinal || "FAIL",
+      URL: row.URL || "",
       ContentDomain: row.ContentDomain || ""
     }))
   };
@@ -408,6 +409,20 @@ async function postOutput(sheetName, data) {
  *  - Không lưu title/content/content_len
  *  ========================= */
 async function initDatabase() {
+  // ============================================
+  // RESET DATABASE: Uncomment đoạn code dưới để xóa bảng cũ và tạo lại bảng mới
+  // Sau khi deploy xong, nhớ comment lại để không bị xóa dữ liệu mỗi lần restart
+  // ============================================
+  /*
+  try {
+    console.log(`[${getVietnamLogTime()}] Dropping existing table domain_checks...`);
+    await pool.query(`DROP TABLE IF EXISTS domain_checks CASCADE;`);
+    console.log(`[${getVietnamLogTime()}] Table dropped successfully`);
+  } catch (error) {
+    console.error(`[${getVietnamLogTime()}] Error dropping table: ${error?.message || error}`);
+  }
+  */
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS domain_checks (
       id SERIAL PRIMARY KEY,
@@ -418,12 +433,16 @@ async function initDatabase() {
       status_http VARCHAR(50),
       status_final VARCHAR(10) NOT NULL,
       content_domain TEXT,
+      status VARCHAR(50),
+      redirect_url TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
   `);
 
   // migrate an toàn (nếu table đã tồn tại)
   await pool.query(`ALTER TABLE domain_checks ADD COLUMN IF NOT EXISTS content_domain TEXT;`);
+  await pool.query(`ALTER TABLE domain_checks ADD COLUMN IF NOT EXISTS status VARCHAR(50);`);
+  await pool.query(`ALTER TABLE domain_checks ADD COLUMN IF NOT EXISTS redirect_url TEXT;`);
 
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_domain_checks_domain ON domain_checks(domain);`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_domain_checks_update_time ON domain_checks(update_time);`);
@@ -435,8 +454,8 @@ async function saveToDatabase(result) {
   try {
     const vnDate = getVietnamDate();
     await pool.query(
-      `INSERT INTO domain_checks (domain, isp, dns, update_time, status_http, status_final, content_domain)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      `INSERT INTO domain_checks (domain, isp, dns, update_time, status_http, status_final, content_domain, status, redirect_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
       [
         result.Domain || "",
         result.ISP || "",
@@ -444,7 +463,9 @@ async function saveToDatabase(result) {
         vnDate,
         result.StatusHTTP != null ? String(result.StatusHTTP) : "",
         result.StatusFinal || "FAIL",
-        result.ContentDomain || ""
+        result.ContentDomain || "",
+        result.StatusHTTP != null ? String(result.StatusHTTP) : "",
+        result.URL || ""
       ]
     );
   } catch (error) {
@@ -473,7 +494,7 @@ async function processRow(row) {
   const baseDelayMs = maxTimeTrySec * 1000 + 5000;
 
   const candidates = buildCandidateUrls(domain);
-  if (!domain || candidates.length === 0) {
+      if (!domain || candidates.length === 0) {
     return {
       Domain: domain,
       ISP: isp,
@@ -481,7 +502,8 @@ async function processRow(row) {
       StatusHTTP: "",
       StatusFinal: "FAIL",
       ContentDomain: "",
-      LastURL: ""
+      LastURL: "",
+      URL: ""
     };
   }
 
@@ -490,6 +512,8 @@ async function processRow(row) {
   let lastUrl = candidates[0];
   let statusFinal = "FAIL";
   let contentDomain = "";
+  let firstStatus = ""; // Lưu status của lần check đầu tiên
+  let redirectUrl = ""; // Lưu URL đích khi 3xx -> 200 thành công
 
   let currentUrl = candidates[0];
   let currentHeaders = null;
@@ -512,11 +536,22 @@ async function processRow(row) {
       lastStatus = String(result.status);
       lastUrl = currentUrl;
 
+      // Lưu status của lần check đầu tiên (slot 1)
+      if (slot === 1) {
+        firstStatus = String(result.status);
+      }
+
       if (result.status === 200) {
         statusFinal = "SUCCESS";
         contentDomain = result.content_domain || "";
+        
+        // Nếu status đầu tiên là 3xx (redirect) và hiện tại thành công 200, lưu URL đích
+        if (firstStatus && parseInt(firstStatus) >= 300 && parseInt(firstStatus) <= 399) {
+          redirectUrl = currentUrl;
+        }
+        
         console.log(
-          `[${getVietnamLogTime()}] [SUCCESS] domain=${domain} status=200 content_domain="${contentDomain ? contentDomain.slice(0, 100) : ""}"`
+          `[${getVietnamLogTime()}] [SUCCESS] domain=${domain} status=200 firstStatus=${firstStatus} content_domain="${contentDomain ? contentDomain.slice(0, 100) : ""}" redirectUrl="${redirectUrl}"`
         );
         break;
       }
@@ -576,6 +611,11 @@ async function processRow(row) {
         }
       }
 
+      // Lưu status của lần check đầu tiên nếu là slot 1
+      if (slot === 1 && !firstStatus) {
+        firstStatus = lastStatus;
+      }
+
       lastUrl = currentUrl;
 
       const fixPlan = getFixPlan({
@@ -607,11 +647,13 @@ async function processRow(row) {
     Domain: domain,
     ISP: isp,
     DNS: dns,
-    StatusHTTP: lastStatus,
+    // StatusHTTP = status của lần check đầu tiên (slot 1)
+    StatusHTTP: firstStatus || lastStatus,
     StatusFinal: statusFinal,
     ContentDomain: contentDomain,
     TriedCount: tried,
-    LastURL: lastUrl
+    LastURL: lastUrl,
+    URL: redirectUrl // URL đích khi 3xx -> 200 thành công
   };
 }
 
@@ -649,7 +691,8 @@ async function processRowsInParallel(rows) {
           StatusFinal: "FAIL",
           ContentDomain: "",
           TriedCount: 0,
-          LastURL: ""
+          LastURL: "",
+          URL: ""
         };
 
         await saveToDatabase(failed);
@@ -752,5 +795,3 @@ async function start() {
 }
 
 start();
-
-
