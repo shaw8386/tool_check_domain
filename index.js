@@ -21,7 +21,7 @@ const { Pool } = pkg;
  * Tuỳ chọn:
  * - DEFAULT_MAX_SLOTS: fallback nếu sheet thiếu Max Slot try (default 3)
  * - DEFAULT_MAXTIME_TRY_SECONDS: fallback nếu sheet thiếu Maxtime try (default 10)
- * - REQUEST_TIMEOUT_MS: timeout mỗi request (default 15000)
+ * - REQUEST_TIMEOUT_MS: timeout mỗi request (default 20000)
  * - MAX_REDIRECT_FIX: giới hạn số lần tự "fix redirect" (default 3)
  * - CONCURRENCY_LIMIT: số row xử lý song song (default 100)
  * - CRON_SCHEDULE: cron chạy theo giờ VN (default: "0 0,3,6,9,12,15,18,21 * * *")
@@ -36,7 +36,7 @@ const GS_OUTPUT_SPREADSHEET_ID = process.env.GS_OUTPUT_SPREADSHEET_ID;
 
 const DEFAULT_MAX_SLOTS = parseInt(process.env.DEFAULT_MAX_SLOTS || "3", 10);
 const DEFAULT_MAXTIME_TRY_SECONDS = parseInt(process.env.DEFAULT_MAXTIME_TRY_SECONDS || "10", 10);
-const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || "15000", 10);
+const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || "20000", 10);
 const MAX_REDIRECT_FIX = parseInt(process.env.MAX_REDIRECT_FIX || "3", 10);
 const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT || "100", 10);
 
@@ -205,7 +205,26 @@ function buildCandidateUrls(domain) {
     urls.push(`http://${h}`);
     urls.push(`https://${h}`);
   }
-  return [...new Set(urls)];
+  
+  // Ưu tiên https://www.xxx trước để giảm redirect
+  const uniqueUrls = [...new Set(urls)];
+  const httpsWww = uniqueUrls.find(u => u.startsWith("https://www."));
+  const httpsNonWww = uniqueUrls.find(u => u.startsWith("https://") && !u.startsWith("https://www."));
+  const httpWww = uniqueUrls.find(u => u.startsWith("http://www."));
+  const httpNonWww = uniqueUrls.find(u => u.startsWith("http://") && !u.startsWith("http://www."));
+  
+  const prioritized = [];
+  if (httpsWww) prioritized.push(httpsWww);
+  if (httpsNonWww) prioritized.push(httpsNonWww);
+  if (httpWww) prioritized.push(httpWww);
+  if (httpNonWww) prioritized.push(httpNonWww);
+  
+  // Thêm các URLs còn lại (nếu có)
+  uniqueUrls.forEach(u => {
+    if (!prioritized.includes(u)) prioritized.push(u);
+  });
+  
+  return prioritized;
 }
 
 /** =========================
@@ -225,9 +244,18 @@ function getFixPlan({ status, errorCode, currentUrl, domain, redirectLocation })
   };
 
   if (errorCode === "ETIMEDOUT" || errorCode === "ECONNABORTED") {
-    plan.extraDelayMs = 2000;
+    plan.extraDelayMs = 3000;
     plan.headers = browserHeaders;
     plan.nextUrls = [currentUrl];
+    return plan;
+  }
+
+  // Network errors: thử lại với browser headers và các URL candidates khác
+  if (errorCode === "ECONNRESET" || errorCode === "ECONNREFUSED" || errorCode === "ENOTFOUND") {
+    plan.extraDelayMs = 2000;
+    plan.headers = browserHeaders;
+    // Thử các URL candidates khác nếu có
+    plan.nextUrls = buildCandidateUrls(domain);
     return plan;
   }
 
@@ -591,29 +619,33 @@ async function processRow(row) {
       const msg = String(err?.message || err);
       const code = err?.code || null;
 
-      // nếu chưa có lastStatus (lần đầu) thì set lỗi để sheet không trống
+      // Network errors: không set lastStatus ngay, để retry với các strategies khác
+      // Chỉ set lastStatus nếu đã retry nhiều lần mà vẫn fail
+      // StatusHTTP chỉ nên chứa HTTP status codes (1xx-5xx), không phải error codes
       if (!lastStatus) {
+        // Chỉ set error code tạm thời để track, nhưng không lưu vào firstStatus
+        // Nếu retry thành công sau đó, sẽ có HTTP status code thực sự
         if (
           code === "CERT_HAS_EXPIRED" ||
           code === "UNABLE_TO_VERIFY_LEAF_SIGNATURE" ||
           code === "SELF_SIGNED_CERT_IN_CHAIN" ||
           msg.toLowerCase().includes("certificate")
         ) {
-          lastStatus = "SSL_ERROR";
+          lastStatus = ""; // Không set SSL_ERROR, để retry
         } else if (code === "ETIMEDOUT" || code === "ECONNABORTED" || msg.toLowerCase().includes("timeout")) {
-          lastStatus = "TIMEOUT";
-        } else if (code === "ECONNREFUSED" || code === "ENOTFOUND") {
-          lastStatus = "CONNECTION_ERROR";
-        } else if (code === "ECONNRESET") {
-          lastStatus = "NETWORK_ERROR";
+          lastStatus = ""; // Không set TIMEOUT, để retry
+        } else if (code === "ECONNREFUSED" || code === "ENOTFOUND" || code === "ECONNRESET") {
+          lastStatus = ""; // Không set NETWORK_ERROR, để retry với các URL khác
         } else {
-          lastStatus = "ERROR";
+          lastStatus = ""; // Không set ERROR, để retry
         }
       }
 
       // Lưu status của lần check đầu tiên nếu là slot 1
+      // CHỈ lưu nếu là HTTP status code (1xx-5xx), không lưu error codes
       if (slot === 1 && !firstStatus) {
-        firstStatus = lastStatus;
+        // Không lưu error codes vào firstStatus, để retry
+        firstStatus = "";
       }
 
       lastUrl = currentUrl;
@@ -627,7 +659,11 @@ async function processRow(row) {
       });
 
       if (fixPlan.headers) currentHeaders = fixPlan.headers;
-      if (fixPlan.nextUrls?.length) currentUrl = fixPlan.nextUrls[0];
+      if (fixPlan.nextUrls?.length) {
+        // Nếu có nhiều URLs (ví dụ: network error thử các candidates), chọn URL khác với currentUrl
+        const pick = fixPlan.nextUrls.find((u) => u !== currentUrl) || fixPlan.nextUrls[0];
+        currentUrl = pick;
+      }
 
       const waitMs = baseDelayMs + (fixPlan.extraDelayMs || 0);
       if (slot < maxSlots) {
@@ -635,10 +671,17 @@ async function processRow(row) {
         await sleep(waitMs);
       }
 
-      if (slot === maxSlots) statusFinal = "FAIL";
+      if (slot === maxSlots) {
+        statusFinal = "FAIL";
+        // Nếu hết retry mà vẫn không có HTTP status code, giữ StatusHTTP rỗng
+        // StatusHTTP chỉ nên chứa HTTP status codes (1xx-5xx)
+        if (!firstStatus || firstStatus === "") {
+          firstStatus = ""; // Giữ rỗng thay vì error code
+        }
+      }
 
       console.error(
-        `[${getVietnamLogTime()}] [FAIL] domain=${domain} slot=${slot}/${maxSlots} url=${currentUrl} proxy=${proxyUrl ? "YES" : "NO"} err=${msg} lastStatus=${lastStatus || "none"}`
+        `[${getVietnamLogTime()}] [FAIL] domain=${domain} slot=${slot}/${maxSlots} url=${currentUrl} proxy=${proxyUrl ? "YES" : "NO"} err=${msg} errorCode=${code} firstStatus=${firstStatus || "none"}`
       );
     }
   }
@@ -648,7 +691,9 @@ async function processRow(row) {
     ISP: isp,
     DNS: dns,
     // StatusHTTP = status của lần check đầu tiên (slot 1)
-    StatusHTTP: firstStatus || lastStatus,
+    // CHỈ chứa HTTP status codes (1xx-5xx), không chứa error codes
+    // Nếu lần đầu network error, StatusHTTP = "" (rỗng)
+    StatusHTTP: firstStatus || "",
     StatusFinal: statusFinal,
     ContentDomain: contentDomain,
     TriedCount: tried,
