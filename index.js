@@ -594,6 +594,14 @@ async function processRow(row) {
 
       if (result.status >= 300 && result.status <= 399 && result.redirectLocation) {
         redirectFixCount += 1;
+
+        // Đã có điều hướng (3xx) → luôn ghi lại URL đích (kể cả SUCCESS hay FAIL)
+        if (fixPlan.nextUrls?.length) {
+          const redirectTarget = fixPlan.nextUrls[0];
+          // Lưu URL chuyển hướng cuối cùng (có thể sẽ được overwrite nếu có nhiều lần redirect)
+          redirectUrl = redirectTarget;
+        }
+
         if (redirectFixCount > MAX_REDIRECT_FIX) {
           redirectFixCount = 0;
         } else if (fixPlan.nextUrls?.length) {
