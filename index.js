@@ -687,27 +687,21 @@ async function processRow(row) {
   }
 
   // Tính StatusHTTP cho output:
-  // - Mặc định: status của lần check đầu tiên (firstStatus)
+  // - Mặc định: status của lần check cuối cùng (lastStatus)
   // - Riêng trường hợp đặc biệt: nếu firstStatus là 3xx (redirect),
-  //   thì StatusHTTP sẽ là status của lần check cuối cùng (lastStatus):
-  //     + Nếu redirect thành công -> 200
-  //     + Nếu redirect / retry thất bại -> status HTTP cuối cùng nhận được
-  let statusHttpOutput = firstStatus || "";
+  //   thì StatusHTTP sẽ luôn là firstStatus (3xx) để biết lần đầu là redirect
+  let statusHttpOutput = "";
   const firstCode = firstStatus ? parseInt(firstStatus, 10) : NaN;
   const lastCode = lastStatus ? parseInt(lastStatus, 10) : NaN;
 
-  if (!Number.isNaN(firstCode) && firstCode >= 300 && firstCode <= 399) {
-    // Trường hợp đặc biệt: firstStatus là 3xx
-    // Ưu tiên dùng lastStatus nếu có HTTP status code hợp lệ
-    if (!Number.isNaN(lastCode)) {
-      statusHttpOutput = String(lastCode);
-    } else {
-      statusHttpOutput = firstStatus || "";
-    }
-  } else if (!statusHttpOutput && !Number.isNaN(lastCode)) {
-    // Nếu firstStatus rỗng (ví dụ: lỗi network ở lần đầu nhưng sau đó có HTTP status),
-    // dùng lastStatus làm fallback
+  // Mặc định: lấy status lần cuối nếu là HTTP code hợp lệ
+  if (!Number.isNaN(lastCode)) {
     statusHttpOutput = String(lastCode);
+  }
+
+  // Trường hợp đặc biệt: lần đầu là 3xx → luôn ghi nhận 3xx của lần đầu
+  if (!Number.isNaN(firstCode) && firstCode >= 300 && firstCode <= 399) {
+    statusHttpOutput = String(firstCode);
   }
 
   return {
@@ -715,8 +709,8 @@ async function processRow(row) {
     ISP: isp,
     DNS: dns,
     // StatusHTTP:
-    // - Bình thường: status của lần check đầu tiên (slot 1)
-    // - Nếu lần đầu là 3xx: status của lần check cuối cùng (sau redirect / retry)
+    // - Bình thường: status của lần check cuối cùng
+    // - Nếu lần đầu là 3xx: luôn giữ status 3xx của lần đầu
     StatusHTTP: statusHttpOutput,
     StatusFinal: statusFinal,
     ContentDomain: contentDomain,
