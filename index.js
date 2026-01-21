@@ -740,11 +740,15 @@ async function processRow(row) {
     statusHttpOutput = String(firstCode);
   }
 
-  // Quy tắc cột URL:
-  // - Chỉ ghi URL khi lần đầu (firstStatus) là 3xx (tức là case redirect theo business rule hiện tại).
-  // - Các case khác (4xx/5xx/2xx/network) thì URL để rỗng để tránh hiểu nhầm.
-  const urlOutput =
-    !Number.isNaN(firstCode) && firstCode >= 300 && firstCode <= 399 ? (redirectUrl || "") : "";
+  // Quy tắc cột URL (theo yêu cầu mới):
+  // - Khi StatusHTTP là 3xx:
+  //    + Nếu lấy được URL redirect (redirectUrl != "")  -> SUCCESS (đã set ở trên) và URL = redirectUrl
+  //    + Nếu KHÔNG lấy được URL redirect             -> FAIL và URL = "" (redirectUrl rỗng)
+  // - Khi StatusHTTP không phải 3xx: URL luôn rỗng
+  const statusHttpCode = statusHttpOutput ? parseInt(statusHttpOutput, 10) : NaN;
+  const is3xxStatusHttp = !Number.isNaN(statusHttpCode) && statusHttpCode >= 300 && statusHttpCode <= 399;
+
+  const urlOutput = is3xxStatusHttp ? (redirectUrl || "") : "";
 
   return {
     Domain: domain,
