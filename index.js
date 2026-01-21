@@ -38,7 +38,7 @@ const DEFAULT_MAX_SLOTS = parseInt(process.env.DEFAULT_MAX_SLOTS || "3", 10);
 const DEFAULT_MAXTIME_TRY_SECONDS = parseInt(process.env.DEFAULT_MAXTIME_TRY_SECONDS || "10", 10);
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || "20000", 10);
 const MAX_REDIRECT_FIX = parseInt(process.env.MAX_REDIRECT_FIX || "3", 10);
-const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT || "100", 10);
+const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT || "200", 10);
 
 // Cron cố định theo giờ VN (00:00,03:00,06:00,09:00,12:00,15:00,18:00,21:00)
 const CRON_SCHEDULE = process.env.CRON_SCHEDULE || "0 0,3,6,9,12,15,18,21 * * *";
