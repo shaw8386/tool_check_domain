@@ -564,14 +564,23 @@ async function processRow(row) {
       lastStatus = String(result.status);
       lastUrl = currentUrl;
 
-      // Lưu status của lần check đầu tiên (slot 1)
+      // Lưu status của lần check đầu tiên (slot 1) - CHỈ lưu HTTP status codes (1xx-5xx)
       if (slot === 1) {
         firstStatus = String(result.status);
       }
 
-      // Case 3xx:
-      // - Chỉ cần lấy được URL redirect (Location) là SUCCESS
-      // - Không cần phải load URL đích ra 200
+      // Case 2xx: Thành công ngay, không cần retry
+      if (result.status >= 200 && result.status <= 299) {
+        statusFinal = "SUCCESS";
+        contentDomain = result.content_domain || "";
+        
+        console.log(
+          `[${getVietnamLogTime()}] [SUCCESS] domain=${domain} status=${result.status} firstStatus=${firstStatus} content_domain="${contentDomain ? contentDomain.slice(0, 100) : ""}"`
+        );
+        break;
+      }
+
+      // Case 3xx: Chỉ cần lấy được URL redirect (Location) là SUCCESS
       if (result.status >= 300 && result.status <= 399) {
         if (result.redirectLocation) {
           try {
@@ -580,9 +589,9 @@ async function processRow(row) {
             redirectUrl = String(result.redirectLocation || "").trim();
           }
 
-          // Có redirect URL => coi như SUCCESS theo yêu cầu mới
+          // Có redirect URL => SUCCESS, StatusHTTP = 3xx (ban đầu)
           statusFinal = "SUCCESS";
-          contentDomain = ""; // không load tiếp nên không có content
+          contentDomain = "";
 
           console.log(
             `[${getVietnamLogTime()}] [REDIRECT_SUCCESS] domain=${domain} firstStatus=${firstStatus} status=${result.status} redirectUrl="${redirectUrl}"`
@@ -590,7 +599,7 @@ async function processRow(row) {
           break;
         }
 
-        // 3xx nhưng không có Location => retry đến max, nếu vẫn không có thì FAIL
+        // 3xx nhưng không có Location => retry đến max
         const fixPlan3xx = getFixPlan({
           status: result.status,
           errorCode: null,
@@ -612,21 +621,16 @@ async function processRow(row) {
           continue;
         }
 
-        // maxSlots mà vẫn không có Location
+        // maxSlots mà vẫn không có Location => FAIL, StatusHTTP = 3xx (ban đầu)
         statusFinal = "FAIL";
         break;
       }
 
-      if (result.status === 200) {
-        statusFinal = "SUCCESS";
-        contentDomain = result.content_domain || "";
-        
-        console.log(
-          `[${getVietnamLogTime()}] [SUCCESS] domain=${domain} status=200 firstStatus=${firstStatus} content_domain="${contentDomain ? contentDomain.slice(0, 100) : ""}"`
-        );
-        break;
-      }
+      // Case 1xx, 4xx, 5xx: Retry để cố gắng đạt 2xx
+      // Nếu retry thành công đạt 2xx → StatusHTTP = 2xx, SUCCESS
+      // Nếu hết retry vẫn không 2xx → StatusHTTP = status ban đầu (1xx/4xx/5xx), FAIL
 
+      // Case 1xx, 4xx, 5xx: Tiến hành "Tự xử lý" và retry
       const fixPlan = getFixPlan({
         status: result.status,
         errorCode: null,
@@ -634,10 +638,6 @@ async function processRow(row) {
         domain,
         redirectLocation: result.redirectLocation
       });
-
-      // NOTE: Case 3xx đã được xử lý ở phía trên (SUCCESS nếu lấy được Location),
-      // nên không follow redirect nữa ở đây.
-      redirectFixCount = 0;
 
       if (fixPlan.headers) currentHeaders = fixPlan.headers;
 
@@ -648,9 +648,15 @@ async function processRow(row) {
 
       const waitMs = baseDelayMs + (fixPlan.extraDelayMs || 0);
       if (slot < maxSlots) {
-        console.log(`[${getVietnamLogTime()}] Wait ${Math.round(waitMs / 1000)}s then retry domain=${domain}`);
+        console.log(`[${getVietnamLogTime()}] Wait ${Math.round(waitMs / 1000)}s then retry domain=${domain} (current status=${result.status}, target=2xx)`);
         await sleep(waitMs);
+        // Tiếp tục retry để cố gắng đạt 2xx
+        continue;
       }
+
+      // Hết retry mà vẫn không đạt 2xx → FAIL, StatusHTTP = status ban đầu (1xx/4xx/5xx)
+      statusFinal = "FAIL";
+      break;
     } catch (err) {
       const msg = String(err?.message || err);
       const code = err?.code || null;
@@ -678,10 +684,10 @@ async function processRow(row) {
       }
 
       // Lưu status của lần check đầu tiên nếu là slot 1
-      // CHỈ lưu nếu là HTTP status code (1xx-5xx), không lưu error codes
+      // Nếu slot 1 là network error (không có HTTP status), giữ firstStatus rỗng để retry
+      // Nếu retry sau đó có HTTP status (1xx-5xx), sẽ được xử lý như case (1)
       if (slot === 1 && !firstStatus) {
-        // Không lưu error codes vào firstStatus, để retry
-        firstStatus = "";
+        firstStatus = ""; // Giữ rỗng để đánh dấu là network error ở lần đầu
       }
 
       lastUrl = currentUrl;
@@ -707,13 +713,11 @@ async function processRow(row) {
         await sleep(waitMs);
       }
 
+      // Hết retry mà vẫn không nhận được HTTP status code nào
+      // → StatusHTTP = "NULL" (theo yêu cầu)
       if (slot === maxSlots) {
         statusFinal = "FAIL";
-        // Nếu hết retry mà vẫn không có HTTP status code, giữ StatusHTTP rỗng
-        // StatusHTTP chỉ nên chứa HTTP status codes (1xx-5xx)
-        if (!firstStatus || firstStatus === "") {
-          firstStatus = ""; // Giữ rỗng thay vì error code
-        }
+        // firstStatus vẫn rỗng (đã được set ở trên) → sẽ được xử lý ở phần tính StatusHTTP
       }
 
       console.error(
@@ -722,30 +726,25 @@ async function processRow(row) {
     }
   }
 
-  // Tính StatusHTTP cho output:
-  // - Mặc định: status của lần check cuối cùng (lastStatus)
-  // - Riêng trường hợp đặc biệt: nếu firstStatus là 3xx (redirect),
-  //   thì StatusHTTP sẽ luôn là firstStatus (3xx) để biết lần đầu là redirect
+  // Tính StatusHTTP cho output theo flow chuẩn:
+  // - Nếu retry thành công đạt 2xx → StatusHTTP = 2xx
+  // - Nếu không đạt 2xx nhưng có firstStatus (1xx-5xx) → StatusHTTP = firstStatus
+  // - Nếu không nhận được HTTP status nào cả (chỉ network error) → StatusHTTP = "NULL"
   let statusHttpOutput = "";
   const firstCode = firstStatus ? parseInt(firstStatus, 10) : NaN;
   const lastCode = lastStatus ? parseInt(lastStatus, 10) : NaN;
 
-  // Mặc định: lấy status lần cuối nếu là HTTP code hợp lệ
-  if (!Number.isNaN(lastCode)) {
+  // Nếu retry thành công đạt 2xx → StatusHTTP = 2xx
+  if (!Number.isNaN(lastCode) && lastCode >= 200 && lastCode <= 299) {
     statusHttpOutput = String(lastCode);
   }
-
-  // Trường hợp đặc biệt: lần đầu là 3xx → luôn ghi nhận 3xx của lần đầu
-  if (!Number.isNaN(firstCode) && firstCode >= 300 && firstCode <= 399) {
+  // Nếu có firstStatus (1xx-5xx) → StatusHTTP = firstStatus (status ban đầu)
+  else if (!Number.isNaN(firstCode)) {
     statusHttpOutput = String(firstCode);
   }
-
-  // Nếu sau tất cả retry mà vẫn không bắt được bất kỳ HTTP status code nào
-  // (chỉ gặp lỗi network như ECONNREFUSED, TIMEOUT, ...),
-  // thì gán một mã 5xx đại diện cho lỗi hạ tầng (ví dụ 599 - Network Connect Error)
-  // để đảm bảo StatusHTTP luôn là dạng mã số 1xx-5xx, không bao giờ null/rỗng.
-  if (!statusHttpOutput) {
-    statusHttpOutput = "599"; // 5xx (Network error / không nhận được HTTP status thực)
+  // Nếu không nhận được HTTP status nào cả (chỉ network error) → StatusHTTP = "NULL"
+  else {
+    statusHttpOutput = "NULL";
   }
 
   // Quy tắc cột URL (theo yêu cầu mới):
