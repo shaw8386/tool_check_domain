@@ -740,6 +740,14 @@ async function processRow(row) {
     statusHttpOutput = String(firstCode);
   }
 
+  // Nếu sau tất cả retry mà vẫn không bắt được bất kỳ HTTP status code nào
+  // (chỉ gặp lỗi network như ECONNREFUSED, TIMEOUT, ...),
+  // thì gán một mã 5xx đại diện cho lỗi hạ tầng (ví dụ 599 - Network Connect Error)
+  // để đảm bảo StatusHTTP luôn là dạng mã số 1xx-5xx, không bao giờ null/rỗng.
+  if (!statusHttpOutput) {
+    statusHttpOutput = "599"; // 5xx (Network error / không nhận được HTTP status thực)
+  }
+
   // Quy tắc cột URL (theo yêu cầu mới):
   // - Khi StatusHTTP là 3xx:
   //    + Nếu lấy được URL redirect (redirectUrl != "")  -> SUCCESS (đã set ở trên) và URL = redirectUrl
