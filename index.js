@@ -5,6 +5,7 @@ import pkg from "pg";
 import cron from "node-cron";
 import * as cheerio from "cheerio";
 
+
 const { Pool } = pkg;
 
 /**
@@ -37,7 +38,7 @@ const DEFAULT_MAX_SLOTS = parseInt(process.env.DEFAULT_MAX_SLOTS || "3", 10);
 const DEFAULT_MAXTIME_TRY_SECONDS = parseInt(process.env.DEFAULT_MAXTIME_TRY_SECONDS || "10", 10);
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || "20000", 10);
 const MAX_REDIRECT_FIX = parseInt(process.env.MAX_REDIRECT_FIX || "3", 10);
-const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT || "200", 10);
+const CONCURRENCY_LIMIT = parseInt(process.env.CONCURRENCY_LIMIT || "100", 10);
 
 // Cron cố định theo giờ VN (00:00,03:00,06:00,09:00,12:00,15:00,18:00,21:00)
 const CRON_SCHEDULE = process.env.CRON_SCHEDULE || "0 0,3,6,9,12,15,18,21 * * *";
@@ -540,7 +541,7 @@ async function processRow(row) {
   let statusFinal = "FAIL";
   let contentDomain = "";
   let firstStatus = ""; // Lưu status của lần check đầu tiên
-  let redirectUrl = ""; // Lưu URL đích khi 3xx -> 200 thành công
+  let redirectUrl = ""; // Lưu URL redirect (Location resolved) khi gặp 3xx
 
   let currentUrl = candidates[0];
   let currentHeaders = null;
@@ -568,17 +569,60 @@ async function processRow(row) {
         firstStatus = String(result.status);
       }
 
+      // Case 3xx:
+      // - Chỉ cần lấy được URL redirect (Location) là SUCCESS
+      // - Không cần phải load URL đích ra 200
+      if (result.status >= 300 && result.status <= 399) {
+        if (result.redirectLocation) {
+          try {
+            redirectUrl = new URL(result.redirectLocation, currentUrl).toString();
+          } catch {
+            redirectUrl = String(result.redirectLocation || "").trim();
+          }
+
+          // Có redirect URL => coi như SUCCESS theo yêu cầu mới
+          statusFinal = "SUCCESS";
+          contentDomain = ""; // không load tiếp nên không có content
+
+          console.log(
+            `[${getVietnamLogTime()}] [REDIRECT_SUCCESS] domain=${domain} firstStatus=${firstStatus} status=${result.status} redirectUrl="${redirectUrl}"`
+          );
+          break;
+        }
+
+        // 3xx nhưng không có Location => retry đến max, nếu vẫn không có thì FAIL
+        const fixPlan3xx = getFixPlan({
+          status: result.status,
+          errorCode: null,
+          currentUrl,
+          domain,
+          redirectLocation: null
+        });
+
+        if (fixPlan3xx.headers) currentHeaders = fixPlan3xx.headers;
+
+        const waitMs = baseDelayMs + (fixPlan3xx.extraDelayMs || 0);
+        if (slot < maxSlots) {
+          console.log(
+            `[${getVietnamLogTime()}] [REDIRECT_NO_LOCATION] status=${result.status} retry slot ${slot}/${maxSlots} after ${Math.round(
+              waitMs / 1000
+            )}s domain=${domain}`
+          );
+          await sleep(waitMs);
+          continue;
+        }
+
+        // maxSlots mà vẫn không có Location
+        statusFinal = "FAIL";
+        break;
+      }
+
       if (result.status === 200) {
         statusFinal = "SUCCESS";
         contentDomain = result.content_domain || "";
         
-        // Nếu status đầu tiên là 3xx (redirect) và hiện tại thành công 200, lưu URL đích
-        if (firstStatus && parseInt(firstStatus) >= 300 && parseInt(firstStatus) <= 399) {
-          redirectUrl = currentUrl;
-        }
-        
         console.log(
-          `[${getVietnamLogTime()}] [SUCCESS] domain=${domain} status=200 firstStatus=${firstStatus} content_domain="${contentDomain ? contentDomain.slice(0, 100) : ""}" redirectUrl="${redirectUrl}"`
+          `[${getVietnamLogTime()}] [SUCCESS] domain=${domain} status=200 firstStatus=${firstStatus} content_domain="${contentDomain ? contentDomain.slice(0, 100) : ""}"`
         );
         break;
       }
@@ -591,24 +635,9 @@ async function processRow(row) {
         redirectLocation: result.redirectLocation
       });
 
-      if (result.status >= 300 && result.status <= 399 && result.redirectLocation) {
-        redirectFixCount += 1;
-
-        // Đã có điều hướng (3xx) → luôn ghi lại URL đích (kể cả SUCCESS hay FAIL)
-        if (fixPlan.nextUrls?.length) {
-          const redirectTarget = fixPlan.nextUrls[0];
-          // Lưu URL chuyển hướng cuối cùng (có thể sẽ được overwrite nếu có nhiều lần redirect)
-          redirectUrl = redirectTarget;
-        }
-
-        if (redirectFixCount > MAX_REDIRECT_FIX) {
-          redirectFixCount = 0;
-        } else if (fixPlan.nextUrls?.length) {
-          currentUrl = fixPlan.nextUrls[0];
-        }
-      } else {
-        redirectFixCount = 0;
-      }
+      // NOTE: Case 3xx đã được xử lý ở phía trên (SUCCESS nếu lấy được Location),
+      // nên không follow redirect nữa ở đây.
+      redirectFixCount = 0;
 
       if (fixPlan.headers) currentHeaders = fixPlan.headers;
 
@@ -711,6 +740,12 @@ async function processRow(row) {
     statusHttpOutput = String(firstCode);
   }
 
+  // Quy tắc cột URL:
+  // - Chỉ ghi URL khi lần đầu (firstStatus) là 3xx (tức là case redirect theo business rule hiện tại).
+  // - Các case khác (4xx/5xx/2xx/network) thì URL để rỗng để tránh hiểu nhầm.
+  const urlOutput =
+    !Number.isNaN(firstCode) && firstCode >= 300 && firstCode <= 399 ? (redirectUrl || "") : "";
+
   return {
     Domain: domain,
     ISP: isp,
@@ -723,7 +758,7 @@ async function processRow(row) {
     ContentDomain: contentDomain,
     TriedCount: tried,
     LastURL: lastUrl,
-    URL: redirectUrl // URL đích khi 3xx -> 200 thành công
+    URL: urlOutput // URL redirect (Location resolved) nếu firstStatus là 3xx
   };
 }
 
